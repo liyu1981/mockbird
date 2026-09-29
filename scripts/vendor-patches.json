@@ -1,0 +1,68 @@
+[
+  {
+    "id": "ort-import",
+    "description": "Use the pinned npm onnxruntime-web instead of a vendored ORT copy.",
+    "find": "import * as ort from \"./vendor/ort/ort.wasm.min.mjs\";",
+    "replace": "import * as ort from \"onnxruntime-web/wasm\";"
+  },
+  {
+    "id": "ort-wasm-paths",
+    "description": "Serve the wasm from /ort/ (self-hosted) instead of the extension URL.",
+    "find": "ort.env.wasm.wasmPaths = chrome.runtime.getURL(\"vendor/ort/\");",
+    "replace": "ort.env.wasm.wasmPaths = \"/ort/\";"
+  },
+  {
+    "id": "tokenizer-guard",
+    "description": "The runtime now runs in a Web Worker, where `document`/`chrome` do not exist.",
+    "find": "if (typeof document === \"undefined\" || typeof chrome === \"undefined\" || !chrome.runtime?.getURL) {\n    throw new Error(\"Tokenizer sandbox requires a browser document context.\");\n  }",
+    "replace": "if (typeof Worker === \"undefined\" || typeof self === \"undefined\") {\n    throw new Error(\"Tokenizer sandbox requires a dedicated worker context.\");\n  }"
+  },
+  {
+    "id": "tokenizer-iframe-to-worker",
+    "description": "Host the SentencePiece bundle in a nested Worker instead of a hidden iframe.",
+    "find": "  tokenizerSandboxReadyPromise = new Promise((resolve, reject) => {\n    const existingFrame = document.getElementById(TOKENIZER_SANDBOX_IFRAME_ID);\n    const iframe = existingFrame instanceof HTMLIFrameElement ? existingFrame : document.createElement(\"iframe\");\n    iframe.id = TOKENIZER_SANDBOX_IFRAME_ID;\n    iframe.src = chrome.runtime.getURL(\"tokenizer_sandbox.html\");\n    iframe.style.position = \"fixed\";\n    iframe.style.width = \"1px\";\n    iframe.style.height = \"1px\";\n    iframe.style.opacity = \"0\";\n    iframe.style.pointerEvents = \"none\";\n    iframe.style.border = \"0\";\n    iframe.style.left = \"-9999px\";\n    iframe.style.top = \"-9999px\";\n    const cleanup = () => {\n      iframe.removeEventListener(\"load\", handleLoad);\n      iframe.removeEventListener(\"error\", handleError);\n    };\n    const handleLoad = () => {\n      cleanup();\n      tokenizerSandboxFrame = iframe;\n      resolve(iframe);\n    };\n    const handleError = () => {\n      cleanup();\n      reject(new Error(\"Failed to load tokenizer sandbox iframe.\"));\n    };\n    iframe.addEventListener(\"load\", handleLoad, { once: true });\n    iframe.addEventListener(\"error\", handleError, { once: true });\n    if (!existingFrame) {\n      (document.documentElement || document.body || document).appendChild(iframe);\n    } else if (iframe.contentWindow) {\n      cleanup();\n      tokenizerSandboxFrame = iframe;\n      resolve(iframe);\n    }\n  }).finally(() => {\n    tokenizerSandboxReadyPromise = null;\n  });\n  return tokenizerSandboxReadyPromise;\n}",
+    "replace": "  tokenizerSandboxReadyPromise = new Promise((resolve, reject) => {\n    let worker;\n    try {\n      worker = new Worker(\"/tokenizer.worker.js\", { type: \"module\", name: \"mockbird-tokenizer\" });\n    } catch (error) {\n      reject(new Error(\"Failed to start tokenizer worker: \" + (error && error.message ? error.message : String(error))));\n      return;\n    }\n    const handleMessage = (event) => {\n      const payload = event.data;\n      if (!payload || payload.source !== TOKENIZER_SANDBOX_SOURCE || payload.type !== \"response\") {\n        return;\n      }\n      const pending = pendingTokenizerSandboxRequests.get(payload.requestId);\n      if (!pending) {\n        return;\n      }\n      pendingTokenizerSandboxRequests.delete(payload.requestId);\n      if (payload.ok) {\n        pending.resolve(payload.data);\n      } else {\n        pending.reject(new Error(payload.error || \"Tokenizer sandbox request failed.\"));\n      }\n    };\n    const handleError = (event) => {\n      reject(new Error((event && event.message) || \"Tokenizer worker failed to load.\"));\n    };\n    worker.addEventListener(\"message\", handleMessage);\n    worker.addEventListener(\"error\", handleError, { once: true });\n    tokenizerSandboxFrame = worker;\n    resolve(worker);\n  }).finally(() => {\n    tokenizerSandboxReadyPromise = null;\n  });\n  return tokenizerSandboxReadyPromise;\n}"
+  },
+  {
+    "id": "tokenizer-drop-window-listener",
+    "description": "The worker message handler lives in ensureTokenizerSandboxFrame now.",
+    "find": "if (typeof window !== \"undefined\" && !window.__nanoReaderTokenizerSandboxListenerInstalled) {\n  window.__nanoReaderTokenizerSandboxListenerInstalled = true;\n  window.addEventListener(\"message\", (event) => {\n    if (event.source !== tokenizerSandboxFrame?.contentWindow) {\n      return;\n    }\n    const payload = event.data;\n    if (!payload || payload.source !== TOKENIZER_SANDBOX_SOURCE || payload.type !== \"response\") {\n      return;\n    }\n    const pending = pendingTokenizerSandboxRequests.get(payload.requestId);\n    if (!pending) {\n      return;\n    }\n    pendingTokenizerSandboxRequests.delete(payload.requestId);\n    if (payload.ok) {\n      pending.resolve(payload.data);\n    } else {\n      pending.reject(new Error(payload.error || \"Tokenizer sandbox request failed.\"));\n    }\n  });\n}\n",
+    "replace": ""
+  },
+  {
+    "id": "tokenizer-post-to-worker",
+    "description": "postMessage goes to the nested Worker.",
+    "find": "async function postTokenizerSandboxRequest(action, data = {}) {\n  const iframe = await ensureTokenizerSandboxFrame();\n  if (!iframe.contentWindow) {\n    throw new Error(\"Tokenizer sandbox iframe is not ready.\");\n  }\n  const requestId = `tokenizer-${Date.now()}-${tokenizerSandboxRequestCounter += 1}`;\n  return new Promise((resolve, reject) => {\n    pendingTokenizerSandboxRequests.set(requestId, { resolve, reject });\n    iframe.contentWindow.postMessage({\n      source: TOKENIZER_SANDBOX_SOURCE,\n      type: \"request\",\n      requestId,\n      action,\n      ...data\n    }, \"*\");\n  });\n}",
+    "replace": "async function postTokenizerSandboxRequest(action, data = {}) {\n  const worker = await ensureTokenizerSandboxFrame();\n  const requestId = `tokenizer-${Date.now()}-${tokenizerSandboxRequestCounter += 1}`;\n  return new Promise((resolve, reject) => {\n    pendingTokenizerSandboxRequests.set(requestId, { resolve, reject });\n    worker.postMessage({\n      source: TOKENIZER_SANDBOX_SOURCE,\n      type: \"request\",\n      requestId,\n      action,\n      ...data\n    });\n  });\n}"
+  },
+  {
+    "id": "lazy-codec-encode-session",
+    "description": "The 45 MB encoder is only needed for cloning, so create its session lazily.",
+    "find": "      [\"codecEncode\", joinRelativeAssetPath(codecBaseDir, this.codecMeta.files.encode), resolveModelExternalDataRelativePaths(codecBaseDir, this.codecMeta.external_data_files, this.codecMeta.files.encode)]\n    ];",
+    "replace": "      ...await this.maybeCodecEncodeSessionSpec(codecBaseDir)\n    ];"
+  },
+  {
+    "id": "codec-encode-helper",
+    "description": "Companion method for the lazy codec-encode session.",
+    "find": "  async warmup() {",
+    "replace": "  async maybeCodecEncodeSessionSpec(codecBaseDir) {\n    const relativePath = joinRelativeAssetPath(codecBaseDir, this.codecMeta.files.encode);\n    const available = typeof this.assetReader?.exists === \"function\"\n      ? await this.assetReader.exists({rootPath: this.localPathRoot, relativePath: relativePath})\n      : true;\n    if (!available) {\n      this.log(`Voice cloning encoder not cached, skipping its session: ${relativePath}`);\n      return [];\n    }\n    return [[\n      \"codecEncode\",\n      relativePath,\n      resolveModelExternalDataRelativePaths(codecBaseDir, this.codecMeta.external_data_files, this.codecMeta.files.encode)\n    ]];\n  }\n  async warmup() {"
+  },
+  {
+    "id": "encode-from-waveform",
+    "description": "AudioContext is unavailable in Workers: accept pre-decoded 48 kHz PCM instead.",
+    "find": "  async encodeReferenceAudioFromFile(file) {\n    const totalStartedAt = this.profileState?.enabled ? nowMs() : 0;\n    await this.ensureManifestLoaded();\n    await this.ensureCodecEncodeLoaded();\n    try {\n      const fileBuffer = file instanceof ArrayBuffer ? file : await file.arrayBuffer();\n      const { waveform, waveformLength } = await this.decodeAudioToWaveform(fileBuffer);\n      const codecEncodeStartedAt",
+    "replace": "  async encodeReferenceAudioFromFile(file) {\n    const fileBuffer = file instanceof ArrayBuffer ? file : await file.arrayBuffer();\n    const { waveform, waveformLength } = await this.decodeAudioToWaveform(fileBuffer);\n    return this.encodeReferenceAudioFromWaveform(waveform, waveformLength);\n  }\n  async encodeReferenceAudioFromWaveform(waveform, waveformLength) {\n    const totalStartedAt = this.profileState?.enabled ? nowMs() : 0;\n    await this.ensureManifestLoaded();\n    await this.ensureCodecEncodeLoaded();\n    try {\n      if (!(waveform instanceof Float32Array) || !waveformLength) {\n        throw new Error(\"encodeReferenceAudioFromWaveform expects a channel-major Float32Array and a length.\");\n      }\n      const codecEncodeStartedAt"
+  },
+  {
+    "id": "warmup-skip-missing-encoder",
+    "description": "The codec encoder session is optional now, so warmup must tolerate its absence.",
+    "find": "    const encodeChannels = this.codecMeta.codec_config.channels;\n    const encodeLength = Math.max(this.codecMeta.codec_config.downsample_rate, 4096);\n    const waveform = new Float32Array(encodeChannels * encodeLength);\n    await this.sessions.codecEncode.run(this.buildCodecEncodeFeeds(waveform, encodeLength));",
+    "replace": "    if (this.sessions.codecEncode) {\n      const encodeChannels = this.codecMeta.codec_config.channels;\n      const encodeLength = Math.max(this.codecMeta.codec_config.downsample_rate, 4096);\n      const waveform = new Float32Array(encodeChannels * encodeLength);\n      await this.sessions.codecEncode.run(this.buildCodecEncodeFeeds(waveform, encodeLength));\n    } else {\n      this.log(\"Voice cloning encoder not cached; skipping its warmup pass.\");\n    }"
+  },
+  {
+    "id": "tokenizer-frame-is-a-worker",
+    "description": "With a Worker instead of an iframe there is no .contentWindow; keeping the upstream check would spawn a fresh tokenizer Worker (and lose the loaded model) on every request.",
+    "find": "  if (tokenizerSandboxFrame?.contentWindow) {\n    return Promise.resolve(tokenizerSandboxFrame);\n  }",
+    "replace": "  if (tokenizerSandboxFrame) {\n    return Promise.resolve(tokenizerSandboxFrame);\n  }"
+  }
+]
