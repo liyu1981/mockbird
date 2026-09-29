@@ -4,6 +4,7 @@ import { Geist, Geist_Mono } from "next/font/google";
 import "./globals.css";
 import { EngineProvider } from "@/components/engine/EngineProvider";
 import { AppShell } from "@/components/layout/AppShell";
+import { ThemeProvider } from "@/components/ThemeProvider";
 import { Toaster } from "@/components/ui/sonner";
 import { TooltipProvider } from "@/components/ui/tooltip";
 
@@ -30,8 +31,8 @@ export const metadata: Metadata = {
 
 export const viewport: Viewport = {
   themeColor: [
-    { media: "(prefers-color-scheme: light)", color: "#ffffff" },
-    { media: "(prefers-color-scheme: dark)", color: "#0a0a0a" },
+    { media: "(prefers-color-scheme: light)", color: "#fafafa" },
+    { media: "(prefers-color-scheme: dark)", color: "#09090b" },
   ],
 };
 
@@ -43,12 +44,14 @@ export default function RootLayout({ children }: LayoutProps<"/">) {
       suppressHydrationWarning
     >
       <body className="min-h-full bg-background text-foreground">
-        <TooltipProvider>
-          <EngineProvider>
-            <AppShell>{children}</AppShell>
-            <Toaster position="bottom-right" richColors closeButton />
-          </EngineProvider>
-        </TooltipProvider>
+        <ThemeProvider>
+          <TooltipProvider>
+            <EngineProvider>
+              <AppShell>{children}</AppShell>
+              <Toaster position="bottom-right" richColors closeButton />
+            </EngineProvider>
+          </TooltipProvider>
+        </ThemeProvider>
       </body>
     </html>
   );
