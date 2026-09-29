@@ -9,7 +9,6 @@
  */
 
 import { useAtom, useAtomValue, useSetAtom } from "jotai";
-import { usePathname } from "next/navigation";
 import { createContext, useCallback, useContext, useEffect, useMemo, useRef } from "react";
 import { toast } from "sonner";
 import { type StreamPlayer, useStreamPlayer } from "@/audio/useStreamPlayer";
@@ -66,7 +65,6 @@ function getClient(): TtsWorkerClient | null {
 const EngineContext = createContext<EngineApi | null>(null);
 
 export function EngineProvider({ children }: { children: React.ReactNode }) {
-  const pathname = usePathname();
   const client = useMemo(() => getClient(), []);
   const player = useStreamPlayer(true);
 
@@ -113,11 +111,6 @@ export function EngineProvider({ children }: { children: React.ReactNode }) {
       { atom: historyAtom, key: STORAGE_KEYS.history },
     ]);
   }, []);
-
-  // A new page means a new context for "which voice am I using".
-  useEffect(() => {
-    setSelectedVoice(null);
-  }, [pathname, setSelectedVoice]);
 
   // --- worker wiring -------------------------------------------------------
   useEffect(() => {

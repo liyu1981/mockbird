@@ -53,6 +53,20 @@ Notes:
   report to `/tmp/mockbird-e2e/report.json`. If it is aborted with a signal, check
   for a leftover `chromium` process and the `/tmp/mockbird-e2e-profile` directory.
 
+## Interface (do not undo without asking)
+
+- **No sidebar.** One centred glass panel with three tabs — `/` Generate, `/clone`
+  Clone, `/settings` Settings — floating over an ambient gradient field.
+  `/studio`, `/voices` and `/model` are permanent redirects.
+- **Design language is borrowed from `~/shoufa`**: zinc neutrals, inverted primary
+  (`text-primary` is near-black on light / near-white on dark), violet `--ring`,
+  `--radius: 0.75rem`, and the `.glass-control` / `.apple-panel` / `.ambient-bg`
+  utilities. `ThemeProvider` (next-themes) + `ThemeToggle` came from there too.
+- **Hide the machinery.** Technical controls (threads, sampling, per-file logs,
+  capability report, profiler) live behind `<Details>` disclosures. Casual users
+  should only need: download → pick a voice → press a button.
+- New surfaces should use `src/components/layout/Panel.tsx` (`Panel` + `Details`).
+
 ## Dev environment
 
 - **Always `pnpm`**, never npm/yarn (`packageManager` is pinned).

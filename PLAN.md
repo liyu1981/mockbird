@@ -18,6 +18,7 @@ and `docs/adr/` for the design decisions.
 
 | Plan said | Shipped | Why |
 | --- | --- | --- |
+| Sidebar shell with 4 routes (`/studio` `/voices` `/model` `/settings`) | **One centred glass panel with 3 tabs**: `/` Generate, `/clone` Clone, `/settings` Settings (model + diagnostics merged; the old routes redirect) | Casual-user brief: hide the machinery, keep three decisions — download, pick a voice, press a button. Design language (zinc neutrals, violet ring, `.glass-control` / `.apple-panel` / `.ambient-bg`, animated blob background, light/dark/system toggle) copied from `~/shoufa`. Thread budget, per-file logs, capability report and profiler moved behind disclosures. |
 | Port `mossTtsRuntime.ts` by hand | Vendored the upstream browser runtime + **11 auditable patches** in `scripts/vendor-patches.json`, re-appliable with `pnpm sync:vendor` | 2 400 lines of tensor-layout detail; re-implementing was the single biggest risk. License caveat tracked in §10.1. |
 | Model store, downloader, worker, player, 4 pages | As planned | — |
 | ESLint (flat config) | **Biome** (`biome.json`, `pnpm lint`) | Project decision: Biome for lint + format. |
@@ -25,6 +26,7 @@ and `docs/adr/` for the design decisions.
 | Worker assets via `new URL(..., import.meta.url)` | `public/stream-player.worklet.js` + `public/tokenizer.worker.js`, loaded by string URL | webpack treats a `.ts` worklet reached through `new URL` as a raw asset and the browser rejects its MIME type; `public/` behaves identically under webpack and Turbopack. See ADR 0001. |
 | Encoder weights optional (45 MB) | Same intent, implemented as a **lazy ORT session** + lazy warmup | Upstream creates the encoder session during `ensureSynthesisLoaded`; patched so cloning weights are genuinely optional. |
 | Cross-origin isolation via `next.config.ts` headers | Same | `output: "export"` dropped because it does not support `headers()` — see ADR 0002. |
+| Sidebar shell, 4 routes (`/studio` `/voices` `/model` `/settings`) | **One centred glass panel with 3 tabs**: `/` Generate, `/clone` Clone, `/settings` Settings (model + diagnostics merged). Old routes redirect. Design language (zinc neutrals, violet ring, `.glass-control`/`.apple-panel`/`.ambient-bg`, animated blob background, theme toggle) copied from `~/shoufa`. Technical controls moved behind disclosures. | Casual-user brief: hide the machinery, keep three decisions — download, pick a voice, press a button. |
 | Default 2 ORT threads | 4 (capped by the UI at `hardwareConcurrency - 1`) | Faster on multi-core machines. |
 
 ### Bugs found and fixed during the build (worth remembering)

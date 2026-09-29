@@ -93,16 +93,34 @@ capture the speaker rather than the topic, and two recordings become comparable.
 - **Hear it first** plays the paragraph through a built-in voice, so you know the
   intended phrasing before you read it
 
+## Interface
+
+Everything lives in one centred glass "dialog" with three tabs, floating over an
+ambient gradient field — the design language is borrowed from the
+[Shoufa](~/shoufa) project (zinc neutrals, inverted primary, violet focus ring,
+frosted surfaces, animated blob background, light/dark/system theme toggle).
+
+| Tab | For a casual user | Under the hood |
+| --- | --- | --- |
+| **Generate** | type text, pick a voice, press *Speak*, replay or save | chunked synthesis, streaming AudioWorklet playback, WAV export |
+| **Clone** | read the supplied paragraph, record, name it, press *Create* | 48 kHz encode, audio-token codes, voice library, import/export |
+| **Settings** | one big *Download the model* button, storage and privacy | progress + resume, thread budget, profiler, browser report, engine log |
+
+Technical controls (sampling, chunk sizes, per-file logs, capability report) are
+behind **disclosures** so the default experience stays to three decisions:
+download → pick a voice → press a button.
+
 ## How it works
 
 ```
 Browser tab (Next.js 16, static on Vercel)
 │
 ├─ UI (React 19 + shadcn)            jotai atoms
-│   /model   weight downloader, per-file progress, threads, storage
-│   /voices  recorder / uploader → codec encode → voice library
-│   /studio  text composer → chunked synthesis → streaming player → WAV
-│   /settings runtime diagnostics, cached files, profile, log
+│   One centred glass panel with three tabs:
+│     /            Generate  text → speech, streaming player, history
+│     /clone       Clone     reading script, recorder, voice library
+│     /settings    Settings  model download, storage/privacy, advanced
+│   (/studio, /voices and /model are permanent redirects to those tabs)
 │
 ├─ AudioWorklet playback      (public/stream-player.worklet.js)
 │
