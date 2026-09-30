@@ -31,10 +31,17 @@ export type StreamPlayer = StreamPlayerState & {
   /** Monotonic peak envelope of everything generated so far. */
   peaks: Float32Array;
   append: (channels: Float32Array[], sampleRate: number) => void;
+  /** Queues silence, used for the pause between two spoken chunks. */
+  appendSilence: (seconds: number) => void;
   flush: () => void;
   pause: () => void;
   resume: () => void;
   stop: () => void;
+  /**
+   * Frames currently sitting in the worklet ring buffer. Reads a ref, so the
+   * chunk scheduler can poll it between chunks without re-rendering React.
+   */
+  getBufferedFrames: () => number;
   /** Full generation as a WAV blob (null until audio exists). */
   toWav: () => Blob | null;
 };
@@ -61,6 +68,7 @@ export function useStreamPlayer(enabled: boolean): StreamPlayer {
   const gainRef = useRef<GainNode | null>(null);
   const channelsRef = useRef<[Float32Array[], Float32Array[]]>([[], []]);
   const totalFramesRef = useRef(0);
+  const bufferedRef = useRef(0);
   const [peakVersion, setPeakVersion] = useState(0);
   const peakChunksRef = useRef<Float32Array[]>([]);
   const [state, setState] = useState<StreamPlayerState>({
@@ -108,21 +116,30 @@ export function useStreamPlayer(enabled: boolean): StreamPlayer {
             type: string;
             frames?: number;
             paused?: boolean;
+            starved?: boolean;
             dropped?: number;
           };
-          if (data.type === "buffered" || data.type === "state") {
+          if (data.type === "buffered") {
+            // The worklet reports its fill level ~10x/s while it plays, so this
+            // is the live number the chunk scheduler paces against.
+            bufferedRef.current = data.frames ?? bufferedRef.current;
             setState((prev) => ({
               ...prev,
               ready: true,
-              playing: data.paused === true ? false : prev.playing,
-              bufferedFrames: data.frames ?? prev.bufferedFrames,
+              playing: data.paused === true ? false : (data.frames ?? bufferedRef.current) > 0,
+              bufferedFrames: bufferedRef.current,
             }));
           } else if (data.type === "overflow") {
             setState((prev) => ({ ...prev, overflowed: true }));
           } else if (data.type === "stopped") {
+            bufferedRef.current = 0;
             setState((prev) => ({ ...prev, playing: false, bufferedFrames: 0 }));
-          } else if (data.type === "drained") {
-            setState((prev) => ({ ...prev, playing: false }));
+          } else if (data.type === "state") {
+            setState((prev) => ({
+              ...prev,
+              ready: true,
+              playing: data.paused === true ? false : prev.playing,
+            }));
           }
         };
         contextRef.current = context;
@@ -175,10 +192,20 @@ export function useStreamPlayer(enabled: boolean): StreamPlayer {
     }));
   }, []);
 
+  const appendSilence = useCallback(
+    (seconds: number) => {
+      const frames = Math.max(0, Math.round(seconds * SAMPLE_RATE));
+      if (frames === 0) return;
+      append([new Float32Array(frames), new Float32Array(frames)], SAMPLE_RATE);
+    },
+    [append],
+  );
+
   const flush = useCallback(() => {
     channelsRef.current = [[], []];
     totalFramesRef.current = 0;
     peakChunksRef.current = [];
+    bufferedRef.current = 0;
     nodeRef.current?.port.postMessage({ type: "flush" });
     setPeakVersion((version) => version + 1);
     setState((prev) => ({ ...prev, totalFrames: 0, bufferedFrames: 0, overflowed: false }));
@@ -197,8 +224,11 @@ export function useStreamPlayer(enabled: boolean): StreamPlayer {
 
   const stop = useCallback(() => {
     nodeRef.current?.port.postMessage({ type: "stop" });
+    bufferedRef.current = 0;
     setState((prev) => ({ ...prev, playing: false, bufferedFrames: 0 }));
   }, []);
+
+  const getBufferedFrames = useCallback(() => bufferedRef.current, []);
 
   const toWav = useCallback((): Blob | null => {
     const [leftChunks, rightChunks] = channelsRef.current;
@@ -228,5 +258,16 @@ export function useStreamPlayer(enabled: boolean): StreamPlayer {
     // ref, and the version counter is what tells React to recompute.
   }, [peakVersion]);
 
-  return { ...state, peaks, append, flush, pause, resume, stop, toWav };
+  return {
+    ...state,
+    peaks,
+    append,
+    appendSilence,
+    flush,
+    pause,
+    resume,
+    stop,
+    getBufferedFrames,
+    toWav,
+  };
 }

@@ -111,6 +111,12 @@ const state: {
   activeRequest: string | null;
   builtinVoices: BuiltinVoice[] | null;
   tokenCounter: ((text: string) => Promise<number>) | null;
+  /**
+   * Last prompt audio codes, keyed by `cloned:<id>` / `builtin:<name>`. A long
+   * text is spoken as one `synthesize` request per chunk, so without this the
+   * reference codes would be re-read from OPFS and re-materialised every chunk.
+   */
+  promptAudioCodesCache: { key: string; codes: number[][] } | null;
 } = {
   engine: {
     loaded: false,
@@ -125,6 +131,7 @@ const state: {
   activeRequest: null,
   builtinVoices: null,
   tokenCounter: null,
+  promptAudioCodesCache: null,
 };
 
 function publishEngineState() {
@@ -334,41 +341,81 @@ async function applyGenerationDefaults(params: SynthParams): Promise<void> {
   };
 }
 
+/**
+ * Splits user text into the pieces the model will actually speak.
+ *
+ * The runtime normalises first (numbers, units, punctuation) and then packs
+ * whole sentences into chunks of at most `maxTokens` tokens, so chunk
+ * boundaries always land on sentence edges — that is what makes a long text
+ * sound like one speaker rather than a queue of short sentences.
+ */
+async function analyzeText(
+  text: string,
+  maxTokens: number,
+  enableNormalizeTtsText: boolean,
+  enableWeTextProcessing: boolean,
+): Promise<{ tokens: number; chunks: string[] }> {
+  await runtime.ensureTokenizerLoaded();
+  const prepared = runtime.prepareSynthesisText(String(text ?? ""), {
+    enableNormalizeTtsText,
+    enableWeTextProcessing,
+  });
+  const normalized = prepared.text?.trim() ?? "";
+  const tokens = normalized ? await runtime.countTextTokens(normalized) : 0;
+  const chunks = normalized ? await runtime.splitVoiceCloneText(normalized, maxTokens) : [];
+  return { tokens, chunks: chunks.length > 0 ? chunks : normalized ? [normalized] : [] };
+}
+
+async function resolvePromptAudioCodes(
+  request: Extract<Request, { type: "synthesize" }>,
+): Promise<number[][]> {
+  if (request.voiceId) {
+    const cache = state.promptAudioCodesCache;
+    if (cache?.key === `cloned:${request.voiceId}`) return cache.codes;
+    const meta = await readVoiceMeta(request.voiceId);
+    if (!meta) throw new Error("Voice not found — it may have been deleted.");
+    const flat = await readVoiceCodes(request.voiceId);
+    const width = meta.numQuantizers || 16;
+    const codes: number[][] = [];
+    for (let index = 0; index * width < flat.length; index += 1) {
+      codes.push(Array.from(flat.subarray(index * width, (index + 1) * width)));
+    }
+    state.promptAudioCodesCache = { key: `cloned:${request.voiceId}`, codes };
+    return codes;
+  }
+  if (request.builtinVoice) {
+    const cache = state.promptAudioCodesCache;
+    if (cache?.key === `builtin:${request.builtinVoice}`) return cache.codes;
+    const codes = await builtinVoiceCodes(request.builtinVoice);
+    state.promptAudioCodesCache = { key: `builtin:${request.builtinVoice}`, codes };
+    return codes;
+  }
+  throw new Error("Pick a voice before generating.");
+}
+
 async function synthesize(request: Extract<Request, { type: "synthesize" }>) {
   const { requestId } = request;
+  const chunkIndex = Number.isInteger(request.chunkIndex) ? request.chunkIndex : 0;
+  const chunkCount =
+    Number.isInteger(request.chunkCount) && request.chunkCount > 0 ? request.chunkCount : 1;
   const params: SynthParams = { ...DEFAULT_SYNTH_PARAMS, ...request.params };
   const startedAt = Date.now();
   const stats: GenerationStats = {
     startedAt,
     firstAudioMs: null,
-    textChunks: 0,
+    textChunks: 1,
     generatedFrames: 0,
     promptAudioFrames: 0,
     rtf: null,
   };
 
   state.activeRequest = requestId;
-  post({ type: "generation-started", requestId });
+  post({ type: "generation-started", requestId, chunkIndex, chunkCount });
 
   try {
     await applyGenerationDefaults(params);
-    let promptAudioCodes: number[][] | undefined;
-    if (request.voiceId) {
-      const meta = await readVoiceMeta(request.voiceId);
-      if (!meta) throw new Error("Voice not found — it may have been deleted.");
-      const flat = await readVoiceCodes(request.voiceId);
-      const width = meta.numQuantizers || 16;
-      promptAudioCodes = [];
-      for (let index = 0; index * width < flat.length; index += 1) {
-        promptAudioCodes.push(Array.from(flat.subarray(index * width, (index + 1) * width)));
-      }
-      stats.promptAudioFrames = promptAudioCodes.length;
-    } else if (request.builtinVoice) {
-      promptAudioCodes = await builtinVoiceCodes(request.builtinVoice);
-      stats.promptAudioFrames = promptAudioCodes.length;
-    } else {
-      throw new Error("Pick a voice before generating.");
-    }
+    const promptAudioCodes = await resolvePromptAudioCodes(request);
+    stats.promptAudioFrames = promptAudioCodes.length;
 
     const result = await runtime.synthesizeVoiceClone({
       text: request.text,
@@ -397,6 +444,8 @@ async function synthesize(request: Extract<Request, { type: "synthesize" }>) {
               type: "generation-chunk",
               chunk: {
                 requestId,
+                chunkIndex,
+                chunkCount,
                 channels,
                 sampleRate: chunk.sampleRate,
                 isPause: Boolean(chunk.isPause),
@@ -410,6 +459,8 @@ async function synthesize(request: Extract<Request, { type: "synthesize" }>) {
             type: "generation-chunk",
             chunk: {
               requestId,
+              chunkIndex,
+              chunkCount,
               channels,
               sampleRate: chunk.sampleRate,
               isPause: Boolean(chunk.isPause),
@@ -436,17 +487,19 @@ async function synthesize(request: Extract<Request, { type: "synthesize" }>) {
 
     state.cancelled.delete(requestId);
     post({ type: "generation-stats", requestId, stats });
-    post({ type: "generation-done", requestId, stats });
+    post({ type: "generation-done", requestId, chunkIndex, chunkCount, stats });
     post({ type: "profile", snapshot: runtime.getProfileSnapshot() as never });
   } catch (error) {
     const cancelled = state.cancelled.has(requestId);
     state.cancelled.delete(requestId);
     if (cancelled) {
-      post({ type: "generation-done", requestId, stats });
+      post({ type: "generation-done", requestId, chunkIndex, chunkCount, stats });
     } else {
       post({
         type: "generation-error",
         requestId,
+        chunkIndex,
+        chunkCount,
         message: error instanceof Error ? error.message : String(error),
       });
     }
@@ -636,21 +689,28 @@ async function handle(request: Request): Promise<void> {
       state.cancelled.add(request.requestId);
       return;
     }
-    case "count-tokens": {
+    case "analyze-text": {
       try {
-        await runtime.ensureTokenizerLoaded();
-        const ids = await runtime.encodeText(request.text);
-        post({ type: "token-count", text: request.text, tokens: ids.length });
+        const analysis = await analyzeText(
+          request.text,
+          request.maxTokens,
+          request.enableNormalizeTtsText,
+          request.enableWeTextProcessing,
+        );
+        post({ type: "text-analysis", text: request.text, ...analysis });
       } catch (error) {
+        // The composer still needs *something* to show when the tokenizer is
+        // unavailable; estimate rather than failing.
         post({
-          type: "token-count",
+          type: "text-analysis",
           text: request.text,
           tokens: Math.max(1, Math.round(request.text.length / 2)),
+          chunks: request.text.trim() ? [request.text.trim()] : [],
         });
         post({
           type: "engine-log",
           level: "warn",
-          message: `Token count failed: ${
+          message: `Text analysis failed: ${
             error instanceof Error ? error.message : String(error)
           }`,
         });

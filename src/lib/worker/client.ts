@@ -21,6 +21,24 @@ import type {
 
 type Listener = (message: Response) => void;
 
+/**
+ * Which reply each request is actually waiting for.
+ *
+ * The worker stamps the request's `correlationId` onto *every* message it posts
+ * while handling it — progress, `engine-state`, and the `engine-log` lines the
+ * vendored runtime emits while it normalises and tokenizes text. Resolving on
+ * the first message with a matching id therefore hands the caller whatever
+ * arrived first (an `engine-log` with no payload). Requests not listed here
+ * keep the old "first message wins" behaviour.
+ */
+const EXPECTED_RESPONSE: Partial<Record<Request["type"], Response["type"]>> = {
+  probe: "probe-result",
+  "list-voices": "voices",
+  "list-builtin-voices": "builtin-voices",
+  "create-voice": "voice-created",
+  "analyze-text": "text-analysis",
+};
+
 export class TtsWorkerClient {
   private worker: Worker;
   private listeners = new Set<Listener>();
@@ -32,7 +50,11 @@ export class TtsWorkerClient {
   private backlog: Response[] = [];
   private inflight = new Map<
     string,
-    { resolve: (value: Response) => void; reject: (error: Error) => void }
+    {
+      resolve: (value: Response) => void;
+      reject: (error: Error) => void;
+      expect: Response["type"] | null;
+    }
   >();
   private counter = 0;
 
@@ -46,9 +68,14 @@ export class TtsWorkerClient {
       const key = correlationKey(message);
       if (key) {
         const pending = this.inflight.get(key);
-        if (pending) {
+        if (pending && (pending.expect === null || pending.expect === message.type)) {
           this.inflight.delete(key);
           pending.resolve(message);
+        } else if (message.type === "fatal") {
+          // The worker reports request failures with `fatal` and then stops
+          // answering; reject rather than leave the caller waiting forever.
+          this.inflight.delete(key);
+          pending?.reject(new Error(message.message));
         }
       }
       this.bufferOrEmit(message);
@@ -104,10 +131,12 @@ export class TtsWorkerClient {
   ): Promise<R> {
     this.counter += 1;
     const correlationId = `req-${Date.now()}-${this.counter}`;
+    const expect = EXPECTED_RESPONSE[request.type] ?? null;
     return new Promise<R>((resolve, reject) => {
       this.inflight.set(correlationId, {
         resolve: resolve as (value: Response) => void,
         reject,
+        expect,
       });
       this.send({ ...request, correlationId } as Request, transfer);
     });
@@ -195,6 +224,8 @@ export class TtsWorkerClient {
     voiceId: string | null;
     builtinVoice: string | null;
     params: SynthParams;
+    chunkIndex: number;
+    chunkCount: number;
   }): void {
     this.send({ type: "synthesize", ...args });
   }
@@ -207,8 +238,17 @@ export class TtsWorkerClient {
     this.send({ type: "cancel-generation", requestId });
   }
 
-  countTokens(text: string): void {
-    this.send({ type: "count-tokens", text });
+  /**
+   * Token count plus the sentence-aligned chunks a long text would be split
+   * into, so the composer can show both before the user presses Speak.
+   */
+  analyzeText(args: {
+    text: string;
+    maxTokens: number;
+    enableNormalizeTtsText: boolean;
+    enableWeTextProcessing: boolean;
+  }): Promise<Extract<Response, { type: "text-analysis" }>> {
+    return this.request({ type: "analyze-text", ...args });
   }
 
   terminate(): void {

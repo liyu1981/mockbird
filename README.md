@@ -12,6 +12,7 @@ the one-time model download.
   voice
 - **18 built-in voices** — included with the model manifest, no extra download
 - **20 languages**, 48 kHz stereo output
+- **Long text** — split on sentence boundaries, spoken chunk by chunk, saved as one clip
 - **Streaming** — audio starts in about a second while the rest is still decoding
 - **Private by design** — reference audio is encoded to audio codes on-device
 
@@ -144,6 +145,11 @@ synth:  text → normalizer → SentencePiece → ≤75-token chunks
           → streaming moss_audio_tokenizer_decode_step → PCM
           → AudioWorklet playback + WAV export
 ```
+
+Long text is chunked **before** synthesis starts: the composer shows how many
+chunks a text will become, the engine speaks them one at a time (paced so the
+decoder never outruns the speaker), and every chunk plus the short pauses between
+them goes into one WAV. See [ADR 0004](docs/adr/0004-long-form-chunked-generation.md).
 
 ## Deploying to Vercel
 

@@ -24,14 +24,17 @@ import { Slider } from "@/components/ui/slider";
 import { Switch } from "@/components/ui/switch";
 import { Textarea } from "@/components/ui/textarea";
 import { downloadBlob } from "@/lib/tts/audio";
+import { describeChunks, estimateRunSeconds } from "@/lib/tts/chunking";
 import { engineAtom, enginePhaseAtom } from "@/state/modelAtoms";
 import {
+  chunkProgressAtom,
   generationAtom,
   historyAtom,
   realtimeFactorAtom,
   SAMPLE_TEXTS,
   synthParamsAtom,
   textAtom,
+  textChunksAtom,
   textTokensAtom,
 } from "@/state/studioAtoms";
 import { allVoicesAtom, selectedVoiceAtom } from "@/state/voiceAtoms";
@@ -39,13 +42,15 @@ import { allVoicesAtom, selectedVoiceAtom } from "@/state/voiceAtoms";
 const SAMPLE_RATE = 48_000;
 
 export default function GeneratePage() {
-  const { generate, cancel, player, countTokens, ready } = useEngine();
+  const { generate, cancel, player, analyzeText, ready } = useEngine();
   const [text, setText] = useAtom(textAtom);
   const tokens = useAtomValue(textTokensAtom);
+  const chunks = useAtomValue(textChunksAtom);
   const [params, setParams] = useAtom(synthParamsAtom);
   const [selected, setSelected] = useAtom(selectedVoiceAtom);
   const voices = useAtomValue(allVoicesAtom);
   const generation = useAtomValue(generationAtom);
+  const progress = useAtomValue(chunkProgressAtom);
   const engine = useAtomValue(engineAtom);
   const phase = useAtomValue(enginePhaseAtom);
   const rtf = useAtomValue(realtimeFactorAtom);
@@ -53,11 +58,14 @@ export default function GeneratePage() {
 
   const busy = generation.status === "starting" || generation.status === "running";
   const audioSeconds = generation.samples / SAMPLE_RATE;
+  const chunkTotal = generation.chunks.length;
+  const currentChunk =
+    generation.chunkIndex >= 0 ? generation.chunks[generation.chunkIndex] : undefined;
 
   useEffect(() => {
-    const handle = window.setTimeout(() => countTokens(text), 600);
+    const handle = window.setTimeout(() => analyzeText(text), 600);
     return () => window.clearTimeout(handle);
-  }, [countTokens, text]);
+  }, [analyzeText, params.enableNormalizeTtsText, params.voiceCloneMaxTextTokens, text]);
 
   // Pick something sensible the first time voices arrive.
   useEffect(() => {
@@ -153,6 +161,23 @@ export default function GeneratePage() {
             ))}
           </div>
 
+          {chunks.length > 0 && (
+            <p className="text-xs text-muted-foreground">
+              {tokens > 0 && <span className="mr-2">{tokens} tokens</span>}
+              {describeChunks(chunks)}
+              {chunks.length > 1 && (
+                <span className="ml-2">· spoken one chunk after another</span>
+              )}
+            </p>
+          )}
+
+          {chunks.length > 1 && estimateRunSeconds(chunks) > 240 && (
+            <p className="text-xs text-muted-foreground">
+              Long passages are kept in memory until you save or regenerate (~380&nbsp;MB of PCM
+              per 10 minutes).
+            </p>
+          )}
+
           <div className="grid gap-4 sm:grid-cols-2">
             <div className="space-y-1.5">
               <Label>Voice</Label>
@@ -208,7 +233,8 @@ export default function GeneratePage() {
                 </span>
               </div>
               <p className="text-xs text-muted-foreground">
-                Longer text is split automatically, so this only limits each piece.
+                Long text is split on sentence boundaries, spoken chunk by chunk, and saved as
+                one clip.
               </p>
             </div>
           </div>
@@ -264,7 +290,7 @@ export default function GeneratePage() {
             )}
 
             <span className="ml-auto text-xs text-muted-foreground">
-              {tokens > 0 && <span className="mr-3">{tokens} words</span>}
+              {tokens > 0 && !chunks.length && <span className="mr-3">{tokens} tokens</span>}
               {audioSeconds > 0.05 && (
                 <span className="mr-3">
                   {audioSeconds.toFixed(1)}s{rtf ? ` · ${rtf.toFixed(1)}× realtime` : ""}
@@ -277,6 +303,15 @@ export default function GeneratePage() {
             <p className="rounded-lg border border-destructive/40 bg-destructive/5 p-3 text-sm text-destructive">
               {generation.error}
             </p>
+          )}
+
+          {chunkTotal > 0 && (busy || generation.status === "stopping") && (
+            <ChunkProgress
+              done={generation.chunksDone}
+              total={chunkTotal}
+              progress={progress ?? 0}
+              current={currentChunk}
+            />
           )}
 
           {/* ---- the glass player ---- */}
@@ -409,6 +444,36 @@ export default function GeneratePage() {
   );
 }
 
+function ChunkProgress({
+  done,
+  total,
+  progress,
+  current,
+}: {
+  done: number;
+  total: number;
+  progress: number;
+  current?: string;
+}) {
+  return (
+    <div className="space-y-1.5">
+      <div className="flex items-baseline justify-between gap-3 text-xs text-muted-foreground">
+        <span>
+          Chunk {Math.min(done + 1, total)} of {total}
+        </span>
+        <span className="font-mono">{Math.round(progress * 100)}%</span>
+      </div>
+      <div className="h-1.5 w-full overflow-hidden rounded-full bg-foreground/10">
+        <div
+          className="h-full rounded-full bg-primary transition-[width] duration-300"
+          style={{ width: `${Math.max(2, Math.min(100, progress * 100))}%` }}
+        />
+      </div>
+      {current && <p className="line-clamp-2 text-xs text-muted-foreground">{current}</p>}
+    </div>
+  );
+}
+
 function SetupCallout({ phase, hasWeights }: { phase: string; hasWeights: boolean }) {
   const busy = phase === "downloading" || phase === "loading";
   return (
@@ -428,7 +493,9 @@ function SetupCallout({ phase, hasWeights }: { phase: string; hasWeights: boolea
               : "Mockbird needs its speech model before it can make any sound. It is a one-off download that stays in this browser."}
           </p>
         </div>
-        <Button size="lg" render={<Link href="/settings" />}>
+        {/* `render` swaps in a Next <Link> (an <a>), so the Base UI button must
+            drop its native-button semantics instead of warning about them. */}
+        <Button size="lg" nativeButton={false} render={<Link href="/settings" />}>
           {busy ? <Loader2 className="size-4 animate-spin" /> : <Download className="size-4" />}
           {hasWeights ? "Finish setup" : "Get started"}
         </Button>

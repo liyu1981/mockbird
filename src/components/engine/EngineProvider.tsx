@@ -6,6 +6,12 @@
  * It lives in the root layout (so navigating between /model, /voices and /studio
  * never reloads the 670 MB session or interrupts playback) and translates worker
  * messages into jotai atoms. Components read atoms and call `useEngine()`.
+ *
+ * Long texts are spoken **chunk by chunk**: the whole input is split into
+ * sentence-aligned pieces first, then each piece is a separate worker request
+ * whose audio is appended to the same player as it streams in. The run is paced
+ * so the decoder never outruns the speaker, and everything that was produced is
+ * kept for a single WAV download.
  */
 
 import { useAtom, useAtomValue, useSetAtom } from "jotai";
@@ -13,7 +19,9 @@ import { createContext, useCallback, useContext, useEffect, useMemo, useRef } fr
 import { toast } from "sonner";
 import { type StreamPlayer, useStreamPlayer } from "@/audio/useStreamPlayer";
 import type { ModelGroupId } from "@/lib/model/modelManifest";
+import { interChunkGapSeconds } from "@/lib/tts/chunking";
 import { TtsWorkerClient } from "@/lib/worker/client";
+import type { GenerationStats } from "@/lib/worker/protocol";
 import { hydrateAtomsFromStorage } from "@/state/atomWithStorage";
 import {
   capabilitiesAtom,
@@ -29,10 +37,13 @@ import {
   threadsAtom,
 } from "@/state/modelAtoms";
 import {
+  EMPTY_GENERATION_STATS,
   generationAtom,
   historyAtom,
+  IDLE_GENERATION_STATE,
   STORAGE_KEYS,
   synthParamsAtom,
+  textChunksAtom,
   textTokensAtom,
 } from "@/state/studioAtoms";
 import {
@@ -49,9 +60,28 @@ export type EngineApi = {
   ready: boolean;
   downloadModels: (groups: ModelGroupId[]) => void;
   loadEngine: () => void;
-  countTokens: (text: string) => void;
+  /** Token count + chunk plan for the composer, as the user types. */
+  analyzeText: (text: string) => void;
   generate: (args: { text: string; voice: VoiceSelection }) => void;
   cancel: () => void;
+};
+
+const SAMPLE_RATE = 48_000;
+/**
+ * Playback lead the scheduler aims for. The decoder is several times faster than
+ * realtime, so without this the ring buffer would swallow the whole text and
+ * start dropping audio for anything longer than a few sentences.
+ */
+const MIN_LEAD_SECONDS = 2;
+const MAX_LEAD_SECONDS = 40;
+
+type ChunkOutcome = { ok: true; stats: GenerationStats } | { ok: false; message: string };
+
+type Run = {
+  id: string;
+  cancelled: boolean;
+  /** Settles the chunk currently in flight, if any. */
+  settle: ((outcome: ChunkOutcome) => void) | null;
 };
 
 let sharedClient: TtsWorkerClient | null = null;
@@ -81,6 +111,7 @@ export function EngineProvider({ children }: { children: React.ReactNode }) {
   const setSelectedVoice = useSetAtom(selectedVoiceAtom);
   const setGeneration = useSetAtom(generationAtom);
   const setTokenCount = useSetAtom(textTokensAtom);
+  const setTextChunks = useSetAtom(textChunksAtom);
   const setProfile = useSetAtom(profileSnapshotAtom);
   const [threads] = useAtom(threadsAtom);
   const [profiling] = useAtom(profilingEnabledAtom);
@@ -90,7 +121,24 @@ export function EngineProvider({ children }: { children: React.ReactNode }) {
   const capabilities = useAtomValue(capabilitiesAtom);
   const ready = useAtomValue(synthesisReadyAtom);
 
+  /** The run currently speaking, if any. Replaced by every new Speak press. */
+  const runRef = useRef<Run | null>(null);
+  /** Request id of the chunk in flight, so late chunks from a stopped run drop. */
   const activeRequestRef = useRef<string | null>(null);
+  /** Monotonic counter so a slow text analysis cannot overwrite a newer one. */
+  const analysisSeqRef = useRef(0);
+  /** Text the last analysis request was for, echoed back by the worker. */
+  const analysisTextRef = useRef("");
+  /** Serializes runs: the ORT sessions must never run two syntheses at once. */
+  const runChainRef = useRef<Promise<void>>(Promise.resolve());
+  const disposedRef = useRef(false);
+
+  useEffect(() => {
+    disposedRef.current = false;
+    return () => {
+      disposedRef.current = true;
+    };
+  }, []);
 
   const threadsRef = useRef(threads);
   const paramsRef = useRef(params);
@@ -190,6 +238,7 @@ export function EngineProvider({ children }: { children: React.ReactNode }) {
         }
         case "fatal": {
           log("error", message.message);
+          runRef.current?.settle?.({ ok: false, message: message.message });
           setGeneration((prev) => ({
             ...prev,
             status: "error",
@@ -199,15 +248,13 @@ export function EngineProvider({ children }: { children: React.ReactNode }) {
           break;
         }
         case "generation-started": {
-          playerRef.current.flush();
-          setGeneration({
-            requestId: message.requestId,
-            status: "running",
-            error: null,
-            stats: null,
-            samples: 0,
+          // The player is flushed once per *run* (see `generate`), never per
+          // chunk, otherwise every chunk would wipe the audio before it.
+          setGeneration((prev) => ({
+            ...prev,
             streaming: true,
-          });
+            chunkIndex: message.chunkIndex,
+          }));
           break;
         }
         case "generation-chunk": {
@@ -220,35 +267,32 @@ export function EngineProvider({ children }: { children: React.ReactNode }) {
           setGeneration((prev) => ({
             ...prev,
             samples: prev.samples + frames,
+            streaming: true,
           }));
           break;
         }
         case "generation-stats": {
-          setGeneration((prev) => ({ ...prev, stats: message.stats as never }));
+          // Per-chunk stats; the run aggregates them once every chunk is done.
+          setGeneration((prev) => ({
+            ...prev,
+            stats: { ...EMPTY_GENERATION_STATS, ...prev.stats, ...message.stats },
+          }));
           break;
         }
         case "generation-done": {
-          setGeneration((prev) => ({
-            ...prev,
-            status: "done",
-            streaming: false,
-            stats: (message.stats as never) ?? prev.stats,
-          }));
           activeRequestRef.current = null;
+          runRef.current?.settle?.({ ok: true, stats: message.stats });
           break;
         }
         case "generation-error": {
-          setGeneration((prev) => ({
-            ...prev,
-            status: "error",
-            streaming: false,
-            error: message.message,
-          }));
           activeRequestRef.current = null;
+          runRef.current?.settle?.({ ok: false, message: message.message });
           break;
         }
-        case "token-count": {
+        case "text-analysis": {
+          if (message.text !== analysisTextRef.current) break;
           setTokenCount(message.tokens);
+          setTextChunks(message.chunks);
           break;
         }
         case "profile": {
@@ -326,16 +370,11 @@ export function EngineProvider({ children }: { children: React.ReactNode }) {
   const downloadModels = useCallback(
     (groups: ModelGroupId[]) => {
       if (!client) return;
+      runRef.current = null;
+      activeRequestRef.current = null;
       playerRef.current.stop();
       playerRef.current.flush();
-      setGeneration({
-        requestId: null,
-        status: "idle",
-        error: null,
-        stats: null,
-        samples: 0,
-        streaming: false,
-      });
+      setGeneration({ ...IDLE_GENERATION_STATE });
       client.downloadModels(groups);
     },
     [client, setGeneration],
@@ -345,12 +384,36 @@ export function EngineProvider({ children }: { children: React.ReactNode }) {
     client?.loadEngine(threadsRef.current);
   }, [client]);
 
-  const countTokens = useCallback(
+  const analyzeText = useCallback(
     (text: string) => {
-      if (!client || !text.trim()) return;
-      client.countTokens(text);
+      if (!client) return;
+      const params = paramsRef.current;
+      const trimmed = text.trim();
+      analysisTextRef.current = text;
+      analysisSeqRef.current += 1;
+      const seq = analysisSeqRef.current;
+      if (!trimmed) {
+        setTokenCount(0);
+        setTextChunks([]);
+        return;
+      }
+      void client
+        .analyzeText({
+          text,
+          maxTokens: params.voiceCloneMaxTextTokens,
+          enableNormalizeTtsText: params.enableNormalizeTtsText,
+          enableWeTextProcessing: params.enableWeTextProcessing,
+        })
+        .then((result) => {
+          if (analysisSeqRef.current !== seq || analysisTextRef.current !== text) return;
+          // The worker is the trust boundary here: never let a malformed reply
+          // put `undefined` into an atom the UI iterates over.
+          setTokenCount(Number.isFinite(result?.tokens) ? result.tokens : 0);
+          setTextChunks(Array.isArray(result?.chunks) ? result.chunks : []);
+        })
+        .catch(() => undefined);
     },
-    [client],
+    [client, setTextChunks, setTokenCount],
   );
 
   const generate = useCallback(
@@ -364,34 +427,216 @@ export function EngineProvider({ children }: { children: React.ReactNode }) {
         toast.error("The engine is still loading. Check the Model tab.");
         return;
       }
-      const requestId = `gen-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
-      activeRequestRef.current = requestId;
+
+      // A new press supersedes whatever was speaking. The previous run is asked
+      // to stop and this one is queued behind it, so the ORT sessions are never
+      // driven by two requests at the same time.
+      const previous = runRef.current;
+      if (previous && !previous.cancelled) {
+        previous.cancelled = true;
+        if (activeRequestRef.current) client.cancelGeneration(activeRequestRef.current);
+      }
+      activeRequestRef.current = null;
       setSelectedVoice(voice);
-      setGeneration({
-        requestId,
-        status: "starting",
-        error: null,
-        stats: null,
-        samples: 0,
-        streaming: false,
-      });
-      client.synthesize({
-        requestId,
-        text,
-        voiceId: voice.kind === "cloned" ? voice.id : null,
-        builtinVoice: voice.kind === "builtin" ? voice.id : null,
-        params: paramsRef.current,
-      });
+
+      const run: Run = {
+        id: `gen-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
+        cancelled: false,
+        settle: null,
+      };
+      runRef.current = run;
+      const params = paramsRef.current;
+
+      /** Still the run the user is waiting on (not superseded, not unmounted). */
+      const isCurrent = () => runRef.current === run && !disposedRef.current;
+      /** ... and nobody asked it to stop. */
+      const halted = () => !isCurrent() || run.cancelled;
+
+      const speakChunk = (chunkText: string, index: number, count: number) => {
+        const requestId = `${run.id}#${index}`;
+        activeRequestRef.current = requestId;
+        return new Promise<ChunkOutcome>((resolve) => {
+          run.settle = (outcome) => {
+            run.settle = null;
+            resolve(outcome);
+          };
+          client.synthesize({
+            requestId,
+            text: chunkText,
+            voiceId: voice.kind === "cloned" ? voice.id : null,
+            builtinVoice: voice.kind === "builtin" ? voice.id : null,
+            params,
+            chunkIndex: index,
+            chunkCount: count,
+          });
+        });
+      };
+
+      /** Waits until the player has drained to a safe lead before the next chunk. */
+      const waitForLead = async (leadSeconds: number) => {
+        const deadlineFrames = leadSeconds * SAMPLE_RATE;
+        // Hard cap: the wait depends on the worklet's fill reports. If they
+        // stop arriving (old cached worklet, suspended context) the run must
+        // continue anyway rather than sit on "Working…" forever.
+        const startedAt = Date.now();
+        const maxWaitMs = Math.max(4_000, leadSeconds * 2_000);
+        while (!halted() && playerRef.current.getBufferedFrames() > deadlineFrames) {
+          if (Date.now() - startedAt > maxWaitMs) break;
+          await new Promise((resolve) => window.setTimeout(resolve, 120));
+        }
+      };
+
+      /** Everything decoded so far in this run, in seconds. */
+      const runAudioSeconds = () => playerRef.current.totalFrames / SAMPLE_RATE;
+
+      const start = async () => {
+        // Flush once per run: everything spoken by this run accumulates in the
+        // player so it can be exported as a single clip.
+        if (!isCurrent()) return;
+        playerRef.current.stop();
+        playerRef.current.flush();
+        setGeneration({
+          ...IDLE_GENERATION_STATE,
+          runId: run.id,
+          requestId: run.id,
+          status: "starting",
+        });
+        const startedAt = Date.now();
+
+        const analysis = await Promise.race([
+          client
+            .analyzeText({
+              text,
+              maxTokens: params.voiceCloneMaxTextTokens,
+              enableNormalizeTtsText: params.enableNormalizeTtsText,
+              enableWeTextProcessing: params.enableWeTextProcessing,
+            })
+            .catch(() => null),
+          // A dead worker must not leave the button spinning forever; fall back
+          // to speaking the text as one piece.
+          new Promise<null>((resolve) => window.setTimeout(() => resolve(null), 10_000)),
+        ]);
+        if (halted()) {
+          // Cancelled while queued: nothing was generated for this run.
+          if (runRef.current === run) {
+            setGeneration((prev) => ({ ...prev, status: "idle", streaming: false }));
+          }
+          return;
+        }
+
+        const usable = (Array.isArray(analysis?.chunks) ? analysis.chunks : []).filter(
+          (chunk) => Boolean(chunk?.trim()),
+        );
+        const chunks = usable.length > 0 ? usable : [text.trim()];
+        setGeneration((prev) => ({ ...prev, chunks }));
+
+        let firstAudioMs: number | null = null;
+        let promptAudioFrames = 0;
+        let generatedFrames = 0;
+        let leadSeconds = MIN_LEAD_SECONDS;
+
+        const publishStats = (chunksDone: number) => {
+          const audioSeconds = runAudioSeconds();
+          setGeneration((prev) => ({
+            ...prev,
+            chunksDone,
+            streaming: false,
+            stats: {
+              startedAt,
+              firstAudioMs,
+              textChunks: chunks.length,
+              generatedFrames,
+              promptAudioFrames,
+              rtf: audioSeconds > 0 ? (Date.now() - startedAt) / 1000 / audioSeconds : null,
+            },
+          }));
+        };
+
+        for (let index = 0; index < chunks.length; index += 1) {
+          if (halted()) {
+            // Stopped by the user: keep whatever was decoded so it can be saved.
+            if (isCurrent()) {
+              publishStats(Math.min(index, chunks.length));
+              setGeneration((prev) => ({ ...prev, status: "done" }));
+            }
+            return;
+          }
+
+          if (index > 0) {
+            // Let the speaker catch up, then breathe between two chunks so the
+            // result sounds like one passage rather than a queue of clips.
+            await waitForLead(leadSeconds);
+            if (halted()) continue;
+            playerRef.current.appendSilence(interChunkGapSeconds(chunks[index]));
+          }
+
+          const chunkStartedAt = Date.now();
+          setGeneration((prev) => ({
+            ...prev,
+            status: index === 0 ? "starting" : "running",
+            chunkIndex: index,
+            streaming: false,
+          }));
+
+          const outcome = await speakChunk(chunks[index], index, chunks.length);
+          if (!isCurrent()) return;
+
+          if (run.cancelled) {
+            publishStats(Math.min(index + 1, chunks.length));
+            setGeneration((prev) => ({ ...prev, status: "done" }));
+            return;
+          }
+
+          // Aim for enough buffered audio to cover the next chunk's generation
+          // time, so playback never underruns between two chunks.
+          const chunkSeconds = (Date.now() - chunkStartedAt) / 1000;
+          leadSeconds = Math.min(
+            MAX_LEAD_SECONDS,
+            Math.max(MIN_LEAD_SECONDS, chunkSeconds * 1.5),
+          );
+
+          if (outcome.ok) {
+            firstAudioMs ??= outcome.stats.firstAudioMs;
+            promptAudioFrames = outcome.stats.promptAudioFrames;
+            generatedFrames += outcome.stats.generatedFrames;
+          }
+          publishStats(index + 1);
+
+          if (!outcome.ok) {
+            setGeneration((prev) => ({
+              ...prev,
+              status: "error",
+              error:
+                chunks.length > 1
+                  ? `Chunk ${index + 1} of ${chunks.length} failed: ${outcome.message}`
+                  : outcome.message,
+            }));
+            return;
+          }
+        }
+
+        if (!isCurrent()) return;
+        setGeneration((prev) => ({ ...prev, status: "done", streaming: false }));
+      };
+
+      // Serialize runs: the worker handles one synthesis at a time.
+      const chained = runChainRef.current.then(start, start);
+      runChainRef.current = chained.then(
+        () => undefined,
+        () => undefined,
+      );
+      void chained;
     },
     [client, ready, setGeneration, setSelectedVoice],
   );
 
   const cancel = useCallback(() => {
-    if (!client) return;
+    const run = runRef.current;
+    if (!run || run.cancelled) return;
+    run.cancelled = true;
     const requestId = activeRequestRef.current;
-    if (!requestId) return;
-    client.cancelGeneration(requestId);
-    setGeneration((prev) => ({ ...prev, status: "stopping" }));
+    if (requestId) client?.cancelGeneration(requestId);
+    setGeneration((prev) => (prev.status === "done" ? prev : { ...prev, status: "stopping" }));
   }, [client, setGeneration]);
 
   const api = useMemo<EngineApi>(
@@ -401,11 +646,11 @@ export function EngineProvider({ children }: { children: React.ReactNode }) {
       ready,
       downloadModels,
       loadEngine,
-      countTokens,
+      analyzeText,
       generate,
       cancel,
     }),
-    [client, player, ready, downloadModels, loadEngine, countTokens, generate, cancel],
+    [client, player, ready, downloadModels, loadEngine, analyzeText, generate, cancel],
   );
 
   // Expose the engine through a React context so pages can call `useEngine()`.

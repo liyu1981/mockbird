@@ -39,6 +39,9 @@ export const SAMPLE_TEXTS: { id: string; label: string; text: string }[] = [
 export const textAtom = atom("");
 export const textTokensAtom = atom(0);
 
+/** Sentence-aligned chunks the current text would be spoken as. */
+export const textChunksAtom = atom<string[]>([]);
+
 export const synthParamsAtom = atomWithStorage<SynthParams>(STORAGE_KEYS.synthParams, {
   ...DEFAULT_SYNTH_PARAMS,
 });
@@ -48,6 +51,8 @@ export const advancedOpenAtom = atom(false);
 export type GenerationStatus = "idle" | "starting" | "running" | "stopping" | "done" | "error";
 
 export type GenerationState = {
+  /** Identifies one Speak press; every chunk request of the run derives from it. */
+  runId: string | null;
   requestId: string | null;
   status: GenerationStatus;
   error: string | null;
@@ -56,18 +61,41 @@ export type GenerationState = {
   samples: number;
   /** True while the decoder is still streaming audio. */
   streaming: boolean;
+  /** The text split this run is speaking, in order. */
+  chunks: string[];
+  /** Chunks whose audio has been received (including the trailing gap). */
+  chunksDone: number;
+  /** 0-based index of the chunk currently being generated; -1 before the first. */
+  chunkIndex: number;
 };
 
 const idleGeneration: GenerationState = {
+  runId: null,
   requestId: null,
   status: "idle",
   error: null,
   stats: null,
   samples: 0,
   streaming: false,
+  chunks: [],
+  chunksDone: 0,
+  chunkIndex: -1,
 };
 
+/** Shared frozen-by-convention reset state for a fresh run. */
+export const IDLE_GENERATION_STATE = idleGeneration;
+
 export const generationAtom = atom<GenerationState>(idleGeneration);
+
+/** Neutral stats, so partial worker updates never leave undefined fields. */
+export const EMPTY_GENERATION_STATS: GenerationStats = {
+  startedAt: 0,
+  firstAudioMs: null,
+  textChunks: 0,
+  generatedFrames: 0,
+  promptAudioFrames: 0,
+  rtf: null,
+};
 
 export type HistoryEntry = {
   id: string;
@@ -91,4 +119,13 @@ export const realtimeFactorAtom = atom<number | null>((get) => {
   const audioSec = get(generationAtom).samples / 48_000;
   if (audioSec <= 0) return null;
   return stats.rtf / audioSec;
+});
+
+/** 0..1 across the whole run; null when the run has not started yet. */
+export const chunkProgressAtom = atom<number | null>((get) => {
+  const generation = get(generationAtom);
+  const total = generation.chunks.length;
+  if (total === 0) return null;
+  const done = Math.min(total, generation.chunksDone);
+  return total === 1 ? (done > 0 ? 1 : 0) : done / total;
 });

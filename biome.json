@@ -11,6 +11,7 @@
       "!**/node_modules",
       "!**/.next",
       "!**/out",
+      "!**/upstream",
       "!public",
       "!src/components/ui",
       "!src/lib/tts/vendor",

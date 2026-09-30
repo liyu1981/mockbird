@@ -43,7 +43,7 @@ export const engineLogAtom = atom<{ level: string; message: string; at: number }
 export const profileSnapshotAtom = atom<ProfileSnapshot | null>(null);
 
 /** User preference: ORT worker threads (capped by hardware at load time). */
-export const threadsAtom = atom<number>(4);
+export const threadsAtom = atom<number>(8);
 export const profilingEnabledAtom = atom(false);
 
 export const downloadSummaryAtom = atom<DownloadSummary>((get) => {

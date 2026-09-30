@@ -59,6 +59,9 @@ export type BuiltinVoice = {
 
 export type AudioChunkMessage = {
   requestId: string;
+  /** 0-based index of the text chunk being spoken; -1 when unknown. */
+  chunkIndex: number;
+  chunkCount: number;
   /** Channel-major PCM (left, right) at 48 kHz. */
   channels: Float32Array[];
   sampleRate: number;
@@ -109,10 +112,19 @@ export type RequestBody =
       voiceId: string | null;
       builtinVoice: string | null;
       params: SynthParams;
+      /** 0-based position of this text chunk inside the user's run. */
+      chunkIndex: number;
+      chunkCount: number;
     }
   | { type: "cancel-generation"; requestId: string }
   | { type: "set-profiling"; enabled: boolean }
-  | { type: "count-tokens"; text: string };
+  | {
+      type: "analyze-text";
+      text: string;
+      maxTokens: number;
+      enableNormalizeTtsText: boolean;
+      enableWeTextProcessing: boolean;
+    };
 
 /** Every request may carry a correlation id; the worker echoes it on replies. */
 export type Request = RequestBody & { correlationId?: string };
@@ -139,12 +151,24 @@ export type Response =
   | { type: "builtin-voices"; voices: BuiltinVoice[] }
   | { type: "voice-created"; result: ClonedVoiceResult }
   | { type: "voice-deleted"; id: string }
-  | { type: "generation-started"; requestId: string }
+  | { type: "generation-started"; requestId: string; chunkIndex: number; chunkCount: number }
   | { type: "generation-chunk"; chunk: AudioChunkMessage }
   | { type: "generation-stats"; requestId: string; stats: Partial<GenerationStats> }
-  | { type: "generation-done"; requestId: string; stats: GenerationStats }
-  | { type: "generation-error"; requestId: string; message: string }
-  | { type: "token-count"; text: string; tokens: number }
+  | {
+      type: "generation-done";
+      requestId: string;
+      chunkIndex: number;
+      chunkCount: number;
+      stats: GenerationStats;
+    }
+  | {
+      type: "generation-error";
+      requestId: string;
+      chunkIndex: number;
+      chunkCount: number;
+      message: string;
+    }
+  | { type: "text-analysis"; text: string; tokens: number; chunks: string[] }
   | { type: "profile"; snapshot: ProfileSnapshot | null }
   | { type: "fatal"; message: string };
 
