@@ -38,6 +38,8 @@ import {
   type StoredVoiceMeta,
   writeVoice,
 } from "@/lib/model/opfsStore";
+import { isWgpuBackend } from "@/lib/tts/engine/backend";
+import { WgpuTtsRuntime } from "@/lib/tts/engine/runtime";
 import { createBrowserOnnxTtsRuntime } from "@/lib/tts/vendor/mossTtsRuntime";
 import type {
   BuiltinVoice,
@@ -54,16 +56,29 @@ declare const self: DedicatedWorkerGlobalScope;
 
 const MODEL_ROOT = "models";
 
-const runtime = createBrowserOnnxTtsRuntime({
-  logger: (message: string) => {
-    post({ type: "engine-log", level: "info", message: String(message) });
-  },
-  /**
-   * OPFS-backed asset reader. The vendored runtime resolves every graph, weight
-   * sidecar and metadata JSON through this interface, so nothing has to be
-   * reachable over HTTP.
-   */
-  assetReader: {
+/**
+ * Declared before anything that can post, so no module-scope call (logger,
+ * runtime constructor, …) can hit the temporal dead zone on it.
+ */
+let currentCorrelationId: string | null = null;
+
+const logEngineMessage = (message: string) => {
+  post({ type: "engine-log", level: "info", message: String(message) });
+};
+
+/**
+ * Two runtimes behind one interface (docs/moss-tts-runtime-analysis.md §9.7):
+ * the vendored onnxruntime-web one (default) and the experimental WGSL engine,
+ * selected with NEXT_PUBLIC_ENGINE=wgsl. There is no automatic fallback — a
+ * WGSL failure surfaces instead of being silently served by ORT, because a
+ * silent fallback would hide exactly the differences we are measuring.
+ */
+/**
+ * OPFS-backed asset reader. Both runtimes resolve every graph, weight sidecar and
+ * metadata JSON through this interface, so nothing has to be reachable over HTTP.
+ */
+function opfsAssetReader() {
+  return {
     async exists({ relativePath }: { rootPath: string; relativePath: string }) {
       return hasModelFile(normalizeAssetPath(relativePath));
     },
@@ -76,8 +91,19 @@ const runtime = createBrowserOnnxTtsRuntime({
     async readBuffer({ relativePath }: { rootPath: string; relativePath: string }) {
       return readModelFileBuffer(normalizeAssetPath(relativePath));
     },
-  },
-});
+  };
+}
+
+/**
+ * Two runtimes behind one interface (docs/moss-tts-runtime-analysis.md §9.7):
+ * the vendored onnxruntime-web one (default) and the experimental WGSL engine,
+ * selected with NEXT_PUBLIC_ENGINE=wgsl. There is no automatic fallback — a
+ * WGSL failure surfaces instead of being silently served by ORT, because a
+ * silent fallback would hide exactly the differences we are measuring.
+ */
+const runtime = isWgpuBackend()
+  ? new WgpuTtsRuntime({ logger: logEngineMessage, assetReader: opfsAssetReader() })
+  : createBrowserOnnxTtsRuntime({ logger: logEngineMessage, assetReader: opfsAssetReader() });
 
 function normalizeAssetPath(relativePath: string): string {
   const segments: string[] = [];
@@ -94,8 +120,6 @@ function normalizeAssetPath(relativePath: string): string {
   return segments.join("/");
 }
 
-let currentCorrelationId: string | null = null;
-
 function post(message: Response, transfer?: Transferable[]) {
   if (currentCorrelationId) {
     self.postMessage({ ...message, correlationId: currentCorrelationId }, transfer ?? []);
@@ -103,6 +127,12 @@ function post(message: Response, transfer?: Transferable[]) {
   }
   self.postMessage(message, transfer ?? []);
 }
+
+// the backend is chosen at BUILD time, so surface it in Settings -> log.
+// (must run after `post` and `currentCorrelationId` are initialised)
+logEngineMessage(
+  `tts engine backend: ${isWgpuBackend() ? "wgsl (experimental)" : "ort (vendored)"}`,
+);
 
 const state: {
   engine: EngineState;

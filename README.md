@@ -80,7 +80,26 @@ encrypted-but-untrusted in the latter case. The certificate covers `localhost`,
 | `pnpm typecheck` | `next typegen` + `tsc --noEmit` |
 | `pnpm verify` | typecheck → lint → build |
 | `pnpm e2e` | Headless browser end-to-end check (see below) |
+| `pnpm synth` | Headless WGSL synthesis to a WAV (see below) |
 | `pnpm sync:vendor` | Re-vendor the upstream runtime and re-apply the patches |
+
+### Command-line synthesis
+
+`pnpm synth` runs the WGSL engine in Node (via the headless `webgpu` binding) and
+writes a 48 kHz stereo WAV — useful for checking the engine without a browser.
+It needs the ONNX weight set on disk (the same files the app caches in OPFS):
+
+```bash
+pnpm synth "your paragraph here" 0          # voice index 0
+pnpm synth --list                           # show the built-in voices
+pnpm synth "…" 6 --max-frames 60 --out out.wav
+```
+
+Point it at the weights with `--model-dir` or `MOCKBIRD_MODEL_DIR` (a folder with
+`browser_poc_manifest.json`, the ONNX graphs + `.data` sidecars and
+`tokenizer.model`). `--max-frames` caps the 12.5 Hz frames per chunk: the engine
+currently decodes greedily only, and the model rarely emits its end token, so
+the cap is what keeps a run short (trailing silence is trimmed by default).
 
 ## Voice cloning tips
 

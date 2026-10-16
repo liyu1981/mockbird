@@ -1,0 +1,24 @@
+{
+  "_source": "captured from moss_tts_prefill.onnx under onnxruntime-node 1.30.0 (Apache-2.0 graphs)",
+  "_note": "prompt rows are the first N of the Junhao prefix+text prompt; replay with tests/gpu/prefill.test.mjs",
+  "cases": [
+    {
+      "rows": 8,
+      "dims": [1, 8, 768],
+      "maxAbs": 12.102,
+      "hidden": "prefill-8rows-hidden.f32",
+      "key": "prefill-8rows-layer0-k.f32",
+      "value": "prefill-8rows-layer0-v.f32",
+      "ids": "prefill-8rows-ids.u32"
+    },
+    {
+      "rows": 195,
+      "dims": [1, 195, 768],
+      "maxAbs": 12.102,
+      "hidden": "prefill-195rows-hidden.f32",
+      "key": "prefill-195rows-layer0-k.f32",
+      "value": "prefill-195rows-layer0-v.f32",
+      "ids": "prefill-195rows-ids.u32"
+    }
+  ]
+}

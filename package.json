@@ -20,9 +20,13 @@
     "copy:ort": "node scripts/copy-ort.mjs",
     "copy:tokenizer": "node scripts/copy-tokenizer-worker.mjs",
     "sync:vendor": "node scripts/sync-runtime-vendor.mjs",
+    "synth": "node --import ./tests/gpu/register-ts.mjs tools/synth.mjs",
     "e2e": "node scripts/e2e.mjs",
     "e2e:fresh": "node scripts/e2e.mjs --fresh",
-    "postinstall": "node scripts/copy-ort.mjs && node scripts/copy-tokenizer-worker.mjs"
+    "postinstall": "node scripts/copy-ort.mjs && node scripts/copy-tokenizer-worker.mjs",
+    "test:gpu": "node tests/gpu/device.test.mjs && node --import ./tests/gpu/register-ts.mjs tests/gpu/kernels.test.mjs && node --import ./tests/gpu/register-ts.mjs tests/gpu/loader.test.mjs && node --import ./tests/gpu/register-ts.mjs tests/gpu/upload.test.mjs && node --import ./tests/gpu/register-ts.mjs tests/gpu/prefill.test.mjs && node --import ./tests/gpu/register-ts.mjs tests/gpu/decode.test.mjs",
+    "test:unit": "node --import ./tests/gpu/register-ts.mjs tests/engine/textNormalize.test.mjs && node --import ./tests/gpu/register-ts.mjs tests/engine/assetPaths.test.mjs",
+    "test": "pnpm run test:unit && pnpm run test:gpu"
   },
   "dependencies": {
     "@base-ui/react": "^1.8.0",
@@ -45,8 +49,10 @@
     "@types/node": "^20",
     "@types/react": "^19",
     "@types/react-dom": "^19",
+    "@webgpu/types": "^0.1.74",
     "tailwindcss": "^4",
-    "typescript": "^5"
+    "typescript": "^5",
+    "webgpu": "0.6.1"
   },
   "packageManager": "pnpm@12.4.2"
 }
