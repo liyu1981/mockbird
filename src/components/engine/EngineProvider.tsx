@@ -167,6 +167,14 @@ export function EngineProvider({ children }: { children: React.ReactNode }) {
     const log = (level: "info" | "warn" | "error", message: string) => {
       pushLog((prev) => [...prev, { level, message, at: Date.now() }].slice(-200));
       if (level === "error") setEngineError(message);
+      // Mirror the engine log to the console in development. Next inlines
+      // `process.env.NODE_ENV`, so this branch is dropped from production builds.
+      if (process.env.NODE_ENV !== "production") {
+        const line = `[engine] ${message}`;
+        if (level === "error") console.error(line);
+        else if (level === "warn") console.warn(line);
+        else console.log(line);
+      }
     };
 
     const unsubscribe = client.subscribe((message) => {
@@ -437,6 +445,11 @@ export function EngineProvider({ children }: { children: React.ReactNode }) {
         if (activeRequestRef.current) client.cancelGeneration(activeRequestRef.current);
       }
       activeRequestRef.current = null;
+      // The click is the user gesture that lets the browser start an AudioContext
+      // created on page load. Without this the worklet can stay suspended: the UI
+      // still shows the waveform (peaks are computed on the main thread) but no
+      // sound comes out. `resume()` is a no-op when the context is already running.
+      playerRef.current.resume();
       setSelectedVoice(voice);
 
       const run: Run = {

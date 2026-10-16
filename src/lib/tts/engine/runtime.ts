@@ -513,6 +513,10 @@ export class WgpuTtsRuntime {
         textTokenIds,
       );
       const engine = this.gpu!;
+      this.log(
+        `chunk ${index + 1}/${chunks.length}: ${textTokenIds.length} text tokens, ` +
+          `${promptAudioCodes.length} reference frames, ${request.inputIds.length} prompt rows`,
+      );
       // Each text chunk is its own utterance: reset the KV ring, the codec ring
       // caches and the repetition-penalty history, matching the vendored
       // runtime, which resets its codec streaming session per chunk.
@@ -526,21 +530,29 @@ export class WgpuTtsRuntime {
         this.record("tts.prefill_session", Date.now() - prefillStart);
         throw error;
       }
-      this.record("tts.prefill_session", Date.now() - prefillStart);
+      const prefillMs = Date.now() - prefillStart;
+      this.record("tts.prefill_session", prefillMs);
       this.count("generation.prefill_rows", request.inputIds.length);
+      this.log(`prefill: ${request.inputIds.length} rows in ${prefillMs} ms`);
 
       const generated: number[][] = [];
+      let stoppedOnAudioEnd = false;
       for (let step = 0; step < defaults.max_new_frames; step += 1) {
         if (isCancelled()) break;
         // 17 sequential local-head steps; then one global step
         const frame = await this.nextFrame(hidden);
         if (!frame) {
-          this.log(`generation stopped at step ${step} (audio_end)`);
+          stoppedOnAudioEnd = true;
           this.count("generation.stop_step");
           break;
         }
         generated.push(frame);
         this.count("generation.generated_frames");
+        if (generated.length % 25 === 0) {
+          this.log(
+            `  generated ${generated.length} frames (${(generated.length / 12.5).toFixed(1)} s)…`,
+          );
+        }
         const stepStart = Date.now();
         try {
           hidden = await engine.decodeStep({
@@ -553,14 +565,27 @@ export class WgpuTtsRuntime {
         }
         this.record("tts.decode_session", Date.now() - stepStart);
       }
+      this.log(
+        `generation: ${generated.length} frames (${(generated.length / 12.5).toFixed(1)} s)` +
+          (stoppedOnAudioEnd
+            ? " — stopped on audio_end"
+            : isCancelled()
+              ? " — cancelled"
+              : ` — hit max_new_frames (${defaults.max_new_frames})`),
+      );
 
       const codecStart = Date.now();
       let pcm: Float32Array[] = [];
+      this.log(`decoding ${generated.length} frames to PCM…`);
       try {
         pcm = await engine.decodeFrames(generated);
       } finally {
         this.record("audio_decode.streaming_codec_decode_session", Date.now() - codecStart);
       }
+      this.log(
+        `codec: ${generated.length} frames -> ${pcm[0]?.length ?? 0} samples/channel in ` +
+          `${Date.now() - codecStart} ms`,
+      );
       // One chunk carrying every channel, like the vendored runtime: the worker
       // forwards `chunkData` as `channels` to the AudioWorklet, so splitting the
       // channels into separate chunks would make the player treat each channel as
